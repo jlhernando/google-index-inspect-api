@@ -1,0 +1,31 @@
+{
+  "name": "google-index-inspect-api",
+  "version": "0.0.1",
+  "description": "Extract indexing status from URLs in bulk through Google Search Console API up to 2000 URLs per day",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "google index",
+    "google index checker",
+    "google url inspection tool",
+    "url inspection",
+    "gsc",
+    "gsc api",
+    "google search console",
+    "google search console api"
+  ],
+  "author": "Jose Luis Hernando (https://jlhernando.com/)",
+  "license": "MIT",
+  "dependencies": {
+    "@google-cloud/local-auth": "^1.0.1",
+    "axios": "^0.25.0",
+    "csvtojson": "^2.0.10",
+    "fs": "^0.0.1-security",
+    "json2csv": "^5.0.6",
+    "moment": "^2.29.1",
+    "path": "^0.12.7"
+  }
+}
