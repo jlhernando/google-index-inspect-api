@@ -41,18 +41,38 @@ node index.js
 
 ## Authentication
 
-The tool supports four authentication methods. It tries them in this order automatically: **ADC > OAuth**. You can also explicitly choose **service account** or **gcloud CLI**.
+The tool supports three authentication methods. When running without flags, it tries **ADC** first then falls back to **OAuth**. You can also explicitly use a **service account**.
 
-### Option 1: Application Default Credentials (ADC) — Recommended
+### Option 1: OAuth with Desktop App Credentials — Recommended
 
-The simplest method if you have the [Google Cloud CLI (`gcloud`)](https://cloud.google.com/sdk/docs/install) installed.
+The simplest setup. No redirect URIs to configure, no extra tools needed.
 
-**Prerequisites:**
-1. A Google Cloud project with the **Google Search Console API** enabled:
-   ```bash
-   gcloud services enable searchconsole.googleapis.com
-   ```
-2. An OAuth client ID of type **Desktop app** created in [Google Cloud Console > Credentials](https://console.cloud.google.com/apis/credentials)
+**One-time setup:**
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create or select a project
+3. Enable the **Google Search Console API** via the [API Library](https://console.cloud.google.com/apis/library/searchconsole.googleapis.com)
+4. Go to [APIs & Services > Credentials](https://console.cloud.google.com/apis/credentials)
+5. Click **+ CREATE CREDENTIALS** > **OAuth client ID**
+6. Application type: **Desktop app**
+7. Download the JSON file and save it as `client-secret.json` in the project root
+8. If your project is in "Testing" mode in the [OAuth consent screen](https://console.cloud.google.com/apis/credentials/consent), add your Google account as a test user
+
+> **Note:** New OAuth clients can take 5–60 minutes to propagate. If you get `invalid_client` errors, wait and try again.
+
+**Run:**
+
+```bash
+node index.js --credentials client-secret.json
+```
+
+The tool prints an auth URL in the terminal. Open it in your browser, sign in, and grant access. The tool receives the callback automatically on localhost and continues.
+
+The refresh token is cached in `.gsc-token-cache.json`, so subsequent runs authenticate instantly without a browser.
+
+### Option 2: Application Default Credentials (ADC)
+
+If you have the [Google Cloud CLI (`gcloud`)](https://cloud.google.com/sdk/docs/install) installed, you can set up ADC once and the tool will pick it up automatically with no flags needed.
 
 **Setup (one-time):**
 
@@ -62,7 +82,9 @@ gcloud auth application-default login \
   --client-id-file=client-secret.json
 ```
 
-Replace `client-secret.json` with the path to your downloaded Desktop OAuth client JSON file. This opens a browser for Google sign-in. Once authorized, credentials are saved to `~/.config/gcloud/application_default_credentials.json` and reused automatically.
+This opens a browser for Google sign-in. Once authorized, credentials are saved to `~/.config/gcloud/application_default_credentials.json` and reused automatically.
+
+> **Note:** The `--client-id-file` flag is required because gcloud's default OAuth client doesn't support the `webmasters.readonly` scope. You need the same Desktop app credentials from Option 1. Both `cloud-platform` and `webmasters.readonly` scopes must be included.
 
 **Run:**
 
@@ -71,29 +93,6 @@ node index.js
 ```
 
 No flags needed — ADC is detected automatically.
-
-> **Note:** The `--scopes` flag must include both `cloud-platform` (required by gcloud) and `webmasters.readonly` (required by the Search Console API). Without the webmasters scope, API calls will fail with "insufficient authentication scopes".
-
-### Option 2: OAuth 2.0 (Browser Flow)
-
-A browser-based OAuth flow that runs a local HTTP server and waits for the redirect callback. Used automatically as a fallback when ADC is not available.
-
-**Prerequisites:**
-1. A Google Cloud project with the **Google Search Console API** enabled
-2. An OAuth client ID created in [Google Cloud Console > Credentials](https://console.cloud.google.com/apis/credentials):
-   - For **Desktop app** type: no redirect URIs needed (loopback is automatic)
-   - For **Web application** type: add `http://localhost:3000` as an Authorized redirect URI
-3. Download the credentials JSON and save it as `client-secret.json` in the project root
-
-**Run:**
-
-```bash
-node index.js --credentials client-secret.json
-```
-
-The tool prints an auth URL to the terminal. Open it in your browser, sign in with your Google account, and grant access. After authorization, the tool receives the callback on `http://localhost:3000` and continues.
-
-The refresh token is cached in `.gsc-token-cache.json` so you won't need to re-authenticate on subsequent runs (unless the token is revoked).
 
 ### Option 3: Service Account
 
@@ -111,45 +110,15 @@ Best for automated/headless environments (CI/CD, servers, cron jobs). No browser
 node index.js --service-account path/to/service-account-key.json
 ```
 
-### Option 4: gcloud CLI Token
-
-Uses your existing `gcloud auth login` session directly. This is a quick option but has a caveat: the default gcloud token may not include the Search Console scope, which will result in 403 "insufficient scopes" errors.
-
-**When it works:** If you authenticated gcloud with the webmasters scope (e.g., via `gcloud auth application-default login` with the right scopes, which also sets up your user session).
-
-**Run:**
-
-```bash
-node index.js --gcloud
-```
-
-> **Note:** If you get 403 "insufficient authentication scopes" errors, use Option 1 (ADC) instead, which properly requests the webmasters scope.
-
 ### Authentication Troubleshooting
 
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `invalid_client` | OAuth client ID just created, not yet propagated | Wait 5–60 minutes and retry |
-| `insufficient authentication scopes` | Token doesn't include `webmasters.readonly` scope | Use ADC with `--scopes` flag (Option 1) or OAuth (Option 2) |
+| `insufficient authentication scopes` | Token doesn't include `webmasters.readonly` scope | Re-authenticate with the correct scopes (see Option 1 or 2) |
 | `PERMISSION_DENIED` / 403 | Account doesn't have access to the Search Console property | Add your Google account (or service account email) as a user in [Search Console](https://search.google.com/search-console/) |
-| `redirect_uri_mismatch` | OAuth redirect URI not registered | Add `http://localhost:3000` as authorized redirect URI in Cloud Console |
-| `OAuth timed out after 120s` | Browser auth not completed in time | Open the printed URL manually, complete auth faster |
+| `OAuth timed out after 120s` | Browser auth not completed in time | Open the printed URL manually in your browser |
 | `File does not exist` | Credentials file not found | Check the `--credentials` or `--service-account` path |
-
-### Google Cloud Project Setup Checklist
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create or select a project
-3. Enable the **Google Search Console API**:
-   ```bash
-   gcloud services enable searchconsole.googleapis.com
-   ```
-   Or via the [API Library](https://console.cloud.google.com/apis/library/searchconsole.googleapis.com)
-4. Create OAuth credentials at [APIs & Services > Credentials](https://console.cloud.google.com/apis/credentials):
-   - Click **+ CREATE CREDENTIALS** > **OAuth client ID**
-   - Application type: **Desktop app** (recommended) or **Web application**
-   - Download the JSON file
-5. If your project is in "Testing" mode in the [OAuth consent screen](https://console.cloud.google.com/apis/credentials/consent), add your Google account as a test user
 
 ## CLI Options
 
@@ -164,7 +133,6 @@ Options:
   --delay <ms>                Delay between batches in milliseconds (default: 3000)
   --max-retries <n>           Maximum retry attempts per request (default: 3)
   --service-account <file>    Service account JSON key file (instead of OAuth)
-  --gcloud                    Use gcloud CLI session for authentication
   --credentials <file>        OAuth credentials JSON file (default: "client-secret.json")
   --language <code>           Language code for inspection (default: "en-US")
   --dry-run                   Validate input and show quota estimate only
