@@ -1,174 +1,274 @@
-import { writeFile, mkdir } from 'fs/promises'; // File System access via promises
-import { existsSync } from 'fs'; // File System 
-import axios from 'axios'; // HTTP client
-import { resolve } from 'path'; // Easier directory path handling
-import { authenticate } from '@google-cloud/local-auth'; // Google Authentication Library
-import csv from 'csvtojson' // Convert CSV to JSON
-import moment from 'moment'; // Handle dates
-import { parse } from 'json2csv' // Convert JSON to CSV
+#!/usr/bin/env node
+import { Command } from 'commander';
+import csv from 'csvtojson';
+import chalk from 'chalk';
+import cliProgress from 'cli-progress';
+import { DEFAULTS } from './src/constants.js';
+import { authenticateADC, authenticateDirectOAuth, authenticateServiceAccount } from './src/auth.js';
+import { inspectUrl } from './src/api.js';
+import { RateLimiter } from './src/rate-limiter.js';
+import { validateCsv } from './src/validator.js';
+import { loadCheckpoint, saveCheckpoint, clearCheckpoint } from './src/checkpoint.js';
+import { generateSummary } from './src/formatter.js';
+import { ensureOutputDir, appendResults, writeResults } from './src/output.js';
 
-// Variables
-const endpoint = 'https://searchconsole.googleapis.com/v1/urlInspection/index:inspect'
-const folder = 'RESULTS' // Name of the folder (change to an appropriate name)
-const file = './urls.csv' // File to add URLs
-const chunkNum = 20 // Break URL list into chunks to prevent API errors
-const test = { inspectionUrl: "https://jlhernando.com/blog/how-to-install-node-for-seo/", siteUrl: "https://jlhernando.com/" } // Testing object
+const program = new Command();
 
-// Create results folder
-existsSync(`./${folder}/`)
-  ? console.log(`${folder} folder exists`)
-  : mkdir(`${folder}`);
+program
+  .name('gsc-inspect')
+  .description('Bulk-check URL indexing status via the Google Search Console URL Inspection API')
+  .version('0.1.0')
+  .option('--input <file>', 'Input CSV file path', DEFAULTS.inputFile)
+  .option('--output <dir>', 'Output directory', DEFAULTS.outputDir)
+  .option('--batch-size <n>', 'Batch size for parallel requests', parseInt, DEFAULTS.batchSize)
+  .option('--delay <ms>', 'Delay between batches in milliseconds', parseInt, DEFAULTS.delayMs)
+  .option('--max-retries <n>', 'Maximum retry attempts per request', parseInt, DEFAULTS.maxRetries)
+  .option('--service-account <file>', 'Service account JSON key file (instead of OAuth)')
+  .option('--credentials <file>', 'OAuth credentials JSON file', 'client-secret.json')
+  .option('--language <code>', 'Language code for inspection', DEFAULTS.language)
+  .option('--dry-run', 'Validate input and show quota estimate only')
+  .option('--resume', 'Resume from checkpoint')
+  .option('--filter-verdict <verdict>', 'Filter output by verdict (PASS, FAIL, NEUTRAL)')
+  .option('--only-not-indexed', 'Only include non-indexed URLs in output');
 
-// Custom function to read URLs file
-const readUrls = async (f) => csv().fromFile(f)
+program.parse();
+const opts = program.opts();
 
-// Custom function to extract data from API
-const getData = async (inspectionUrl, siteUrl, authToken) => {
+async function main() {
+  const startTime = Date.now();
 
-  // Construct data object to send to API
-  const body = {
-    inspectionUrl,
-    siteUrl
+  console.log(chalk.bold('\n  GSC URL Inspection Tool\n'));
+
+  // 1. Read CSV input
+  console.log(chalk.cyan('Reading'), opts.input + '...');
+  let rows;
+  try {
+    rows = await csv().fromFile(opts.input);
+  } catch (err) {
+    console.error(chalk.red('Error:'), `Failed to read input file: ${err.message}`);
+    process.exit(1);
   }
 
-  const { data } = await axios({
-    method: 'post',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'Authorization': `Bearer ${authToken}`
-    },
-    url: endpoint,
-    data: body,
-  })
-  return data
-};
-
-// Custom functions to get oAuth credentials from Google
-const getCredentials = async () => {
-  const { credentials } = await authenticate({
-    keyfilePath: resolve('client-secret.json'),
-    scopes: ['https://www.googleapis.com/auth/webmasters'],
-  })
-  return credentials
-}
-
-
-// Authenticated Request Function
-(async () => {
-
-  // Start timer
-  console.time()
-
-  // Get URLs from file
-  const urls = await readUrls(file)
-
-  // Store data from API
-  const data = []
-  const errors = []
-
-  // Start counter to inform user 
-  let counter = 1
-  const totalChunks = Math.ceil(urls.length / chunkNum)
-
-  // Obtain user credentials to use for the request (pop up authentication)
-  console.log('Athenticating...');
-  const credentials = await getCredentials().catch(err => {
-    console.log('FAILED TO AUTHENTICATE USER. Check if your Google account has access to the requested url/property or if your credential-secret.json is correct')
-    process.exit()
-  })
-
-  console.log('Success authenticating user');
-
-  while (urls.length) {
-    // Inform user of number of batches remaining
-    console.log(`###### Requesting batch ${counter} of ${totalChunks} ######`);
-
-    // Get chunk of URLs files
-    const chunk = urls.splice(0, chunkNum)
-
-    // Create batch of promises (array)
-    const promises = chunk.map(({ url, property }) => getData(url, property, credentials.access_token));
-
-    // Send all requests in parallel
-    const rawBatchResults = await Promise.allSettled(promises);
-
-    // Filter data from batch response
-    const fulfilled = rawBatchResults.filter(({ status }) => status === 'fulfilled')
-    const rejected = rawBatchResults.filter(({ status }) => status === 'rejected')
-
-    // If any api call fails push errors to array
-    if (rejected) {
-      const rejectedUrls = rejected.map(({ reason }) => {
-        const { inspectionUrl } = JSON.parse(reason.config.data)
-        return inspectionUrl
-      })
-      errors.push(...rejectedUrls)
+  // 2. Validate input
+  const { valid, invalid } = validateCsv(rows);
+  if (invalid.length > 0) {
+    console.warn(chalk.yellow(`\n  Found ${invalid.length} invalid row(s):`));
+    for (const inv of invalid.slice(0, 10)) {
+      const reasons = inv.reasons ? inv.reasons.join('; ') : inv.reason;
+      console.warn(chalk.yellow(`    Row ${inv.row}:`), reasons);
     }
+    if (invalid.length > 10) {
+      console.warn(chalk.yellow(`    ... and ${invalid.length - 10} more`));
+    }
+  }
 
-    // Process fulfilled requests
-    if (fulfilled) {
-      fulfilled.map(({ value }, index) => {
-        // Create object from response
-        const inspection = value
+  if (valid.length === 0) {
+    console.error(chalk.red('Error:'), 'No valid URLs to process. Exiting.');
+    process.exit(1);
+  }
 
-        // Log progress with results
-        console.log(`Batch ${counter} -> ${chunk[index].url}: ${JSON.stringify(value.inspectionResult.indexStatusResult.coverageState)}`)
+  // Group URLs by property for quota estimate
+  const byProperty = {};
+  for (const row of valid) {
+    if (!byProperty[row.property]) byProperty[row.property] = [];
+    byProperty[row.property].push(row);
+  }
 
-        // Add URL to object
-        inspection.url = chunk[index].url
+  console.log(chalk.green(`\n  ${valid.length} valid URL(s)`), `across ${Object.keys(byProperty).length} property/properties:\n`);
+  for (const [prop, urls] of Object.entries(byProperty)) {
+    console.log(`    ${chalk.dim(prop)}  ${chalk.bold(urls.length)} URL(s)`);
+  }
+  console.log(chalk.dim(`\n  Quota estimate: ${valid.length} requests (daily limit: 2,000/property)`));
 
-        // Push to store data
-        data.push(inspection)
+  // 3. Dry run — stop here
+  if (opts.dryRun) {
+    console.log(chalk.yellow('\n  --dry-run flag set. Exiting without making API calls.\n'));
+    process.exit(0);
+  }
+
+  // 4. Authenticate (service account > ADC > OAuth)
+  console.log(chalk.cyan('\n  Authenticating...'));
+  let authClient;
+  try {
+    if (opts.serviceAccount) {
+      authClient = await authenticateServiceAccount(opts.serviceAccount);
+      console.log(chalk.green('  Authenticated via service account.'));
+    } else {
+      try {
+        authClient = await authenticateADC();
+        console.log(chalk.green('  Authenticated via Application Default Credentials.'));
+      } catch {
+        console.log(chalk.dim('  ADC not available, falling back to OAuth...'));
+        authClient = await authenticateDirectOAuth(opts.credentials);
+        console.log(chalk.green('  Authenticated via OAuth.'));
+      }
+    }
+  } catch (err) {
+    console.error(chalk.red('\n  Authentication failed:'), err.message);
+    console.error(chalk.dim('  Options:'));
+    console.error(chalk.dim('    1. Use --service-account <key.json> for service account auth'));
+    console.error(chalk.dim('    2. Set up ADC: gcloud auth application-default login --scopes=...'));
+    console.error(chalk.dim('    3. Place a client-secret.json in this directory for OAuth'));
+    process.exit(1);
+  }
+
+  // 5. Load checkpoint if resuming
+  await ensureOutputDir(opts.output);
+  let processedUrls = new Set();
+  if (opts.resume) {
+    processedUrls = await loadCheckpoint(opts.output);
+  }
+
+  // Filter out already-processed URLs
+  let urlsToProcess = valid.filter((row) => !processedUrls.has(row.url));
+  if (opts.resume && urlsToProcess.length < valid.length) {
+    console.log(chalk.dim(`  Skipping ${valid.length - urlsToProcess.length} already-processed URL(s).`));
+  }
+
+  if (urlsToProcess.length === 0) {
+    console.log(chalk.green('  All URLs already processed. Nothing to do.\n'));
+    process.exit(0);
+  }
+
+  // 6. Process batches
+  const rateLimiter = new RateLimiter();
+  const results = [];
+  const errors = [];
+  const totalBatches = Math.ceil(urlsToProcess.length / opts.batchSize);
+
+  console.log('');
+  const progressBar = new cliProgress.SingleBar(
+    {
+      format: `  ${chalk.cyan('{bar}')} ${chalk.bold('{percentage}%')} | {value}/{total} URLs | Batch {batch}/{totalBatches}`,
+      barCompleteChar: '\u2588',
+      barIncompleteChar: '\u2591',
+    },
+    cliProgress.Presets.shades_classic
+  );
+  progressBar.start(urlsToProcess.length, 0, { batch: 0, totalBatches });
+
+  let processed = 0;
+
+  // Register graceful shutdown
+  let interrupted = false;
+  const shutdown = async () => {
+    if (interrupted) return;
+    interrupted = true;
+    progressBar.stop();
+    console.log(chalk.yellow('\n\n  Interrupted! Saving checkpoint...'));
+    await saveCheckpoint(opts.output, processedUrls);
+    if (results.length > 0) {
+      await writeResults(opts.output, results, errors, {
+        filterVerdict: opts.filterVerdict,
+        onlyNotIndexed: opts.onlyNotIndexed,
       });
     }
-    counter++
+    printSummary(results, errors, startTime);
+    console.log(chalk.dim('  Checkpoint saved. Use --resume to continue.\n'));
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+    const start = batchIndex * opts.batchSize;
+    const chunk = urlsToProcess.slice(start, start + opts.batchSize);
+
+    progressBar.update(processed, { batch: batchIndex + 1, totalBatches });
+
+    // Process each URL in the batch with rate limiting
+    const batchPromises = chunk.map(async ({ url, property }) => {
+      await rateLimiter.acquire(property);
+      try {
+        const data = await inspectUrl(url, property, authClient, {
+          languageCode: opts.language,
+          maxRetries: opts.maxRetries,
+        });
+        data.url = url;
+        return { status: 'fulfilled', value: data };
+      } catch (error) {
+        return { status: 'rejected', reason: error };
+      }
+    });
+
+    const batchResults = await Promise.all(batchPromises);
+
+    const batchSuccesses = [];
+    for (const result of batchResults) {
+      if (result.status === 'fulfilled') {
+        results.push(result.value);
+        batchSuccesses.push(result.value);
+        processedUrls.add(result.value.url);
+      } else {
+        errors.push(result.reason);
+      }
+      processed++;
+    }
+
+    // Append to partial output for crash resilience
+    if (batchSuccesses.length > 0) {
+      await appendResults(opts.output, batchSuccesses);
+    }
+
+    progressBar.update(processed, { batch: batchIndex + 1, totalBatches });
+
+    // Delay between batches (skip after last batch)
+    if (batchIndex < totalBatches - 1 && opts.delay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, opts.delay));
+    }
   }
 
-  // Write results to JSON
-  if (data.length) {
-    writeFile(`./${folder}/coverage.json`, JSON.stringify(data, null, 2))
+  progressBar.stop();
 
-    // Transform JSON to ideal CSV
-    const output = data.map(({ url, inspectionResult: { indexStatusResult } }) => {
-      const cleanObj = {
-        url,
-        verdict: indexStatusResult.verdict,
-        coverageState: indexStatusResult.coverageState,
-        'Crawl allowed?': indexStatusResult.robotsTxtState,
-        'Indexing allowed?': indexStatusResult.indexingState,
-        'Last crawl': indexStatusResult.lastCrawlTime === '1970-01-01T00:00:00Z' ? 'Not crawled' : moment(indexStatusResult.lastCrawlTime).format('YYYY-MM-DD HH:mm:ss'),
-        'Page fetch': indexStatusResult.pageFetchState,
-        'User-declared canonical': indexStatusResult?.userCanonical ?? 'No User-declared canonical',
-        'Google-selected canonical': indexStatusResult?.googleCanonical ?? 'Inspected URL'
-      }
+  // 7. Write final output
+  console.log(chalk.cyan('\n  Writing results...'));
+  await writeResults(opts.output, results, errors, {
+    filterVerdict: opts.filterVerdict,
+    onlyNotIndexed: opts.onlyNotIndexed,
+  });
 
-      if (indexStatusResult.sitemap) {
-        for (const [index, sitemap] of indexStatusResult.sitemap.entries()) {
-          cleanObj[`sitemap-${index + 1}`] = sitemap
-        }
-      }
+  // 8. Clear checkpoint on success
+  await clearCheckpoint(opts.output);
 
-      if (indexStatusResult.referringUrls) {
-        for (const [index, refUrl] of indexStatusResult.referringUrls.entries()) {
-          cleanObj[`referringUrl-${index + 1}`] = refUrl
-        }
-      }
-      return cleanObj
-    })
+  // 9. Print summary
+  printSummary(results, errors, startTime);
+}
 
-    // Write transformed data to CSV
-    writeFile(`./${folder}/coverage.csv`, parse(output))
+function printSummary(results, errors, startTime) {
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+  console.log(chalk.bold('\n  ── Summary ─────────────────────────────\n'));
+  console.log(`  Total processed:  ${chalk.bold.green(results.length)}`);
+  console.log(`  Errors:           ${errors.length > 0 ? chalk.bold.red(errors.length) : chalk.dim('0')}`);
+
+  if (results.length > 0) {
+    const summary = generateSummary(results);
+
+    console.log(chalk.bold('\n  By verdict:'));
+    for (const [verdict, count] of Object.entries(summary.byVerdict)) {
+      const color = verdict === 'PASS' ? chalk.green : verdict === 'FAIL' ? chalk.red : chalk.yellow;
+      console.log(`    ${color(verdict)}  ${chalk.bold(count)}`);
+    }
+
+    console.log(chalk.bold('\n  By coverage state:'));
+    for (const [state, count] of Object.entries(summary.byCoverageState)) {
+      console.log(`    ${chalk.dim(state)}  ${chalk.bold(count)}`);
+    }
+
+    if (summary.mobileIssuesCount > 0) {
+      console.log(chalk.bold('\n  Mobile usability issues:'), chalk.yellow(summary.mobileIssuesCount));
+    }
+
+    if (summary.richResultTypes.length > 0) {
+      console.log(chalk.bold('\n  Rich result types:'), chalk.magenta(summary.richResultTypes.join(', ')));
+    }
   }
 
-  // Write URLs that have failed
-  if (errors.length) {
-    writeFile(`./${folder}/errors.json`, JSON.stringify(errors, null, 2))
-  }
+  console.log(chalk.dim(`\n  Completed in ${elapsed}s`));
+  console.log(`  Results written to ${chalk.underline(opts.output + '/')}\n`);
+}
 
-  // Final message
-  console.log(`Retrieved Indexing status for ${data.length} URLs & encountered ${errors.length} errors`);
-
-  console.timeEnd()
-})()
-
+main().catch((err) => {
+  console.error(chalk.red('Fatal error:'), err);
+  process.exit(1);
+});

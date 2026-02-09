@@ -1,3 +1,8 @@
 node_modules
 RESULTS
 CLAUDE.md
+improvements*
+.gsc-token-cache.json
+.checkpoint.json
+client_secret_desktop.json
+client_secret_web.json
