@@ -6,3 +6,6 @@ improvements*
 .checkpoint.json
 client_secret_desktop.json
 client_secret_web.json
+client-secret.json
+.claude
+.mcp.json

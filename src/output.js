@@ -14,7 +14,7 @@ import {
  */
 export async function ensureOutputDir(outputDir) {
   if (!existsSync(outputDir)) {
-    await mkdir(outputDir, { recursive: true });
+    await mkdir(outputDir, { recursive: true, mode: 0o700 });
   }
 }
 
@@ -24,7 +24,7 @@ export async function ensureOutputDir(outputDir) {
 export async function appendResults(outputDir, batchResults) {
   const partialPath = join(outputDir, 'coverage-partial.json');
   const entries = batchResults.map((r) => JSON.stringify(r)).join('\n') + '\n';
-  await appendFile(partialPath, entries);
+  await appendFile(partialPath, entries, { mode: 0o600 });
 }
 
 /**
@@ -46,10 +46,13 @@ export async function writeResults(outputDir, results, errors, options = {}) {
     );
   }
 
+  const fileOpts = { mode: 0o600 };
+
   // coverage.json — full raw API responses
   await writeFile(
     join(outputDir, 'coverage.json'),
-    JSON.stringify(filteredResults, null, 2)
+    JSON.stringify(filteredResults, null, 2),
+    fileOpts
   );
 
   // coverage.csv — main index status
@@ -57,7 +60,7 @@ export async function writeResults(outputDir, results, errors, options = {}) {
     .map((r) => formatIndexStatus(r.url, r.inspectionResult))
     .filter(Boolean);
   if (indexRows.length > 0) {
-    await writeFile(join(outputDir, 'coverage.csv'), parse(indexRows));
+    await writeFile(join(outputDir, 'coverage.csv'), parse(indexRows), fileOpts);
   }
 
   // mobile-usability.csv
@@ -65,7 +68,7 @@ export async function writeResults(outputDir, results, errors, options = {}) {
     .map((r) => formatMobileUsability(r.url, r.inspectionResult))
     .filter(Boolean);
   if (mobileRows.length > 0) {
-    await writeFile(join(outputDir, 'mobile-usability.csv'), parse(mobileRows));
+    await writeFile(join(outputDir, 'mobile-usability.csv'), parse(mobileRows), fileOpts);
   }
 
   // rich-results.csv
@@ -73,7 +76,7 @@ export async function writeResults(outputDir, results, errors, options = {}) {
     .map((r) => formatRichResults(r.url, r.inspectionResult))
     .filter(Boolean);
   if (richRows.length > 0) {
-    await writeFile(join(outputDir, 'rich-results.csv'), parse(richRows));
+    await writeFile(join(outputDir, 'rich-results.csv'), parse(richRows), fileOpts);
   }
 
   // amp.csv
@@ -81,14 +84,15 @@ export async function writeResults(outputDir, results, errors, options = {}) {
     .map((r) => formatAmp(r.url, r.inspectionResult))
     .filter(Boolean);
   if (ampRows.length > 0) {
-    await writeFile(join(outputDir, 'amp.csv'), parse(ampRows));
+    await writeFile(join(outputDir, 'amp.csv'), parse(ampRows), fileOpts);
   }
 
   // errors.json
   if (errors.length > 0) {
     await writeFile(
       join(outputDir, 'errors.json'),
-      JSON.stringify(errors, null, 2)
+      JSON.stringify(errors, null, 2),
+      fileOpts
     );
   }
 

@@ -67,7 +67,8 @@ export async function authenticateOAuth() {
   if (auth.credentials?.refresh_token) {
     await writeFile(
       TOKEN_CACHE_PATH,
-      JSON.stringify({ refresh_token: auth.credentials.refresh_token }, null, 2)
+      JSON.stringify({ refresh_token: auth.credentials.refresh_token }, null, 2),
+      { mode: 0o600 }
     );
   }
 
@@ -107,12 +108,16 @@ export async function authenticateServiceAccount(keyFilePath) {
  * and waits for the redirect callback.
  */
 export async function authenticateDirectOAuth(credentialsFile = 'client-secret.json') {
+  const secretData = JSON.parse(await readFile(resolve(credentialsFile), 'utf-8'));
+  const creds = secretData.installed || secretData.web;
+  const { client_id, client_secret } = creds;
+
   // Try cached token first
   if (existsSync(TOKEN_CACHE_PATH)) {
     try {
       const cached = JSON.parse(await readFile(TOKEN_CACHE_PATH, 'utf-8'));
-      if (cached.refresh_token && cached.client_id && cached.client_secret) {
-        const client = new OAuth2Client(cached.client_id, cached.client_secret);
+      if (cached.refresh_token) {
+        const client = new OAuth2Client(client_id, client_secret);
         client.setCredentials({ refresh_token: cached.refresh_token });
         const { token } = await client.getAccessToken();
         if (token) {
@@ -129,9 +134,6 @@ export async function authenticateDirectOAuth(credentialsFile = 'client-secret.j
     }
   }
 
-  const secretData = JSON.parse(await readFile(resolve(credentialsFile), 'utf-8'));
-  const creds = secretData.installed || secretData.web;
-  const { client_id, client_secret } = creds;
   // Start local server on a free port
   const server = http.createServer();
   await new Promise((res) => server.listen(0, res));
@@ -156,8 +158,9 @@ export async function authenticateDirectOAuth(credentialsFile = 'client-secret.j
       const error = url.searchParams.get('error');
 
       if (error) {
+        const safeError = error.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         res.writeHead(400, { 'Content-Type': 'text/html' });
-        res.end(`<h1>Authentication failed</h1><p>${error}</p>`);
+        res.end(`<h1>Authentication failed</h1><p>${safeError}</p>`);
         reject(new Error(`OAuth error: ${error}`));
         return;
       }
@@ -181,7 +184,8 @@ export async function authenticateDirectOAuth(credentialsFile = 'client-secret.j
   if (tokens.refresh_token) {
     await writeFile(
       TOKEN_CACHE_PATH,
-      JSON.stringify({ refresh_token: tokens.refresh_token, client_id, client_secret }, null, 2)
+      JSON.stringify({ refresh_token: tokens.refresh_token }, null, 2),
+      { mode: 0o600 }
     );
   }
 
